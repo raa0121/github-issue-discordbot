@@ -4,6 +4,7 @@ import pprint
 import requests
 import sys
 from threading import Thread
+import urllib.parse
 
 import discord
 import discordoauth2
@@ -102,7 +103,8 @@ def flask_init():
         expires = int(datetime.datetime.now().timestamp()) + max_age
         response = make_response()
         response.set_cookie("installation_id", value=installation_id, expires=expires)
-        response.headers["Location"] = "https://discord.com/oauth2/authorize?client_id=815097353228910643&response_type=code&redirect_uri=https%3A%2F%2Fgithub-issue-discordbot.raa0121.info%2Fcallback_discord&scope=identify"
+        redirect_uri = urllib.parse.quote(os.getenv('DISCORD_CALLBACLK_URL'), safe='')
+        response.headers["Location"] = f"https://discord.com/oauth2/authorize?client_id={os.getenv('DISCORD_CLIENT_ID')}&response_type=code&redirect_uri={redirect_uri}&scope=identify"
         return response, 302
 
     @app.route("/callback_discord")
@@ -120,7 +122,7 @@ def flask_init():
             'client_secret': os.getenv("DISCORD_CLIENT_SECRET"),
             'grant_type': 'authorization_code',
             'code': authorization_code,
-            'redirect_uri': "https://github-issue-discordbot.raa0121.info/callback_discord"
+            'redirect_uri': os.getenv('DISCORD_CALLBACLK_URL')
         }
         accesstoken_request = requests.post('https://discord.com/api/oauth2/token', data=request_postdata)
     
