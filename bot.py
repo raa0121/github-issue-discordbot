@@ -122,7 +122,7 @@ def flask_init():
             'client_secret': os.getenv("DISCORD_CLIENT_SECRET"),
             'grant_type': 'authorization_code',
             'code': authorization_code,
-            'redirect_uri': os.getenv('DISCORD_CALLBACLK_URL')
+            'redirect_uri': os.getenv('DISCORD_CALLBACK_URL')
         }
         accesstoken_request = requests.post('https://discord.com/api/oauth2/token', data=request_postdata)
     
