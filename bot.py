@@ -103,7 +103,7 @@ def flask_init():
         expires = int(datetime.datetime.now().timestamp()) + max_age
         response = make_response()
         response.set_cookie("installation_id", value=installation_id, expires=expires)
-        redirect_uri = urllib.parse.quote(os.getenv('DISCORD_CALLBACLK_URL'), safe='')
+        redirect_uri = urllib.parse.quote(os.getenv('DISCORD_CALLBACK_URL'), safe='')
         response.headers["Location"] = f"https://discord.com/oauth2/authorize?client_id={os.getenv('DISCORD_CLIENT_ID')}&response_type=code&redirect_uri={redirect_uri}&scope=identify"
         return response, 302
 
