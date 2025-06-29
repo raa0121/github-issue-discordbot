@@ -8,7 +8,7 @@ from threading import Thread
 import discord
 import discordoauth2
 from dotenv import load_dotenv
-from flask import Flask, make_response, request
+from flask import Flask, make_response, render_template, request
 from github import Auth
 from github import GithubIntegration
 
@@ -88,8 +88,9 @@ def get_repos(installation_id):
 
 def flask_init():
     @app.route("/")
-    def hello_world():
-        return "<p>hello</p>"
+    def index():
+        response = make_response(render_template("index.html"))
+        return response
 
     @app.route("/callback_github")
     def callback_github():
