@@ -1,0 +1,16 @@
+name = "discord-issue-bot"
+main = "src/index.ts"
+compatibility_date = "2024-10-19"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+DISCORD_APPLICATION_ID = "815097353228910643"
+DISCORD_PUBLIC_KEY = "ae50150a5c0e8cda2cfdd980e329685560a89eb8f863ebf106ca786943c51ce4"
+GITHUB_APP_ID = "1479308"
+
+[ai]
+binding = "AI"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "edc38ab2d02f4e2e9ed565f051cf2b52"
