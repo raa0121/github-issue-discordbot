@@ -1,5 +1,5 @@
 import type { Env } from './env.js';
-import { getAuthenticatedUser } from './github.js';
+import { GITHUB_APP_INSTALL_URL, getAuthenticatedUser } from './github.js';
 import {
   CALLBACK_PATH,
   CONFIRM_PATH,
@@ -61,7 +61,59 @@ export async function handleOAuthConfirm(request: Request, env: Env): Promise<Re
   await saveLink(env.KV, pending.discordUser.id, pending.link);
   return page(
     '連携できたよ！',
-    `<p>GitHub の <strong>${escapeHtml(pending.link.githubLogin)}</strong> と連携したよ。Discord に戻って、もう一度 <code>/issue</code> を実行してね。</p>`,
+    `<p>GitHub の <strong>${escapeHtml(pending.link.githubLogin)}</strong> と連携したよ。Discord に戻って、もう一度 <code>/issue</code> を実行してね。</p>
+<h2>使いたいリポジトリが一覧に出ないときは</h2>
+<p>issue を作りたいリポジトリに、この GitHub App がインストールされている必要があるよ。まだなら、リポジトリのオーナー（組織ならオーナー）が下のページからインストールしてね。インストール済みでも、使えるリポジトリを絞っている場合はここから追加できるよ。</p>
+<p><a href="${GITHUB_APP_INSTALL_URL}">GitHub App をインストールする</a></p>`,
+  );
+}
+
+// Bot はチャンネルの直近メッセージを読むので、閲覧とメッセージ履歴の権限が要る
+const DISCORD_BOT_PERMISSIONS = 1024 /* VIEW_CHANNEL */ + 65536; /* READ_MESSAGE_HISTORY */
+
+export function landingPage(env: Env): Response {
+  const inviteUrl = `https://discord.com/oauth2/authorize?${new URLSearchParams({
+    client_id: env.DISCORD_APPLICATION_ID,
+    scope: 'bot applications.commands',
+    permissions: String(DISCORD_BOT_PERMISSIONS),
+  })}`;
+
+  return page(
+    'issue-discordbot',
+    `<p class="lead">Discord の会話を AI で要約して、GitHub の issue を作れる Bot です。</p>
+<div class="actions">
+  <a class="button" href="${escapeHtml(inviteUrl)}">Discord サーバーに追加する</a>
+  <a class="button secondary" href="${GITHUB_APP_INSTALL_URL}">GitHub リポジトリにインストールする</a>
+</div>
+
+<h2>導入</h2>
+<ol>
+  <li><strong>Discord サーバーの管理者</strong>：「Discord サーバーに追加する」から Bot をサーバーに追加します。</li>
+  <li><strong>リポジトリのオーナー</strong>：「GitHub リポジトリにインストールする」から、issue を作りたいリポジトリに GitHub App をインストールします。一度インストールすれば、どの Discord サーバーからでも使えます。</li>
+</ol>
+
+<h2>使い方</h2>
+<ol>
+  <li>issue にしたい会話があるチャンネルで <code>/issue</code> を実行します。</li>
+  <li>初回だけ「GitHub と連携する」ボタンから GitHub アカウントを連携します。確認ページで、連携先の Discord アカウントを確かめてから「連携する」を押してください。</li>
+  <li>リポジトリと、要約したいメッセージを選びます。</li>
+  <li>要約のプレビューを確認して「✅ 作成する」を押します。「✏️ 編集」で手直し、「🔄 再生成」で要約し直しもできます。</li>
+</ol>
+<p><code>/issue count:10</code> のように、表示するメッセージ数（最大 25 件）を指定できます。Bot の表示は、実行した本人にしか見えません。</p>
+
+<h2>使えるリポジトリ</h2>
+<ul>
+  <li>GitHub App がインストールされていて、あなたが権限（collaborator や組織のメンバーなど）を持つリポジトリだけが表示されます。</li>
+  <li>issue はあなたの GitHub アカウントの名義で作成されます。</li>
+  <li>リポジトリが表示されないときは、リポジトリのオーナーに GitHub App をインストールしてもらってください。インストール済みでも、対象のリポジトリを絞っている場合は追加が必要です。</li>
+</ul>
+
+<h2>扱うデータ</h2>
+<ul>
+  <li>選んだメッセージは、要約のために Cloudflare Workers AI に送られます。issue 本文には、発言者の名前・メッセージ本文・メッセージへのリンクが転記されます。</li>
+  <li><strong>公開リポジトリの場合、転記した内容はインターネット上の誰でも読めます。</strong>他の人の発言や個人的な内容を含めるときは注意してください。</li>
+  <li>連携のために GitHub のアクセストークンを保存します。<code>/issue-unlink</code> で連携を解除すると、トークンも無効になります。</li>
+</ul>`,
   );
 }
 
@@ -79,7 +131,18 @@ function page(title: string, body: string, status = 200): Response {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.7; }
+  :root { color-scheme: light dark; --fg: #1f2328; --muted: #59636e; --bg: #ffffff; --border: #d1d9e0; --accent: #5865f2; --code-bg: #f0f2f4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e6edf3; --muted: #9198a1; --bg: #0d1117; --border: #3d444d; --accent: #7983f5; --code-bg: #262c36; }
+  }
+  body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.7; color: var(--fg); background: var(--bg); }
+  h2 { margin-top: 2.5rem; padding-bottom: 0.25rem; border-bottom: 1px solid var(--border); font-size: 1.25rem; }
+  a { color: var(--accent); }
+  code { background: var(--code-bg); padding: 0.1rem 0.35rem; border-radius: 4px; }
+  .lead { color: var(--muted); }
+  .actions { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 1.5rem 0; }
+  .button { display: inline-block; padding: 0.6rem 1.25rem; border-radius: 6px; background: var(--accent); color: #fff; text-decoration: none; font-weight: 600; }
+  .button.secondary { background: transparent; color: var(--fg); border: 1px solid var(--border); }
   button { font: inherit; padding: 0.5rem 1.25rem; margin-right: 0.5rem; cursor: pointer; }
 </style>
 </head>

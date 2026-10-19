@@ -1,5 +1,7 @@
 import type { InstallInfo, RepoInfo } from './session.js';
 
+export const GITHUB_APP_INSTALL_URL = 'https://github.com/apps/issue-discordbot/installations/new';
+
 type ApiInstallation = { id: number; account: { login?: string; slug?: string } | null };
 type ApiRepository = {
   name: string;

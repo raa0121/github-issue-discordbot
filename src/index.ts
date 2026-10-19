@@ -8,7 +8,7 @@ import {
 } from 'discord-interactions';
 import { editOriginalResponse, jsonResponse, verifyDiscordRequest } from './discord.js';
 import type { Env } from './env.js';
-import { createIssue, listUserInstallations, listUserRepositories } from './github.js';
+import { GITHUB_APP_INSTALL_URL, createIssue, listUserInstallations, listUserRepositories } from './github.js';
 import { buildIssueBody } from './issue-body.js';
 import {
   CALLBACK_PATH,
@@ -23,7 +23,7 @@ import {
 } from './oauth.js';
 import { summarize } from './summarize.js';
 import { deleteSession, getSession, setSession, MessageEntry, RepoInfo, SessionOf } from './session.js';
-import { errorPage, handleOAuthCallback, handleOAuthConfirm } from './web.js';
+import { errorPage, handleOAuthCallback, handleOAuthConfirm, landingPage } from './web.js';
 
 const PAGE_SIZE = 25;
 const DEFAULT_COUNT = 20;
@@ -35,6 +35,7 @@ type TargetRepo = RepoInfo & { installationId: number };
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    if (request.method === 'GET' && url.pathname === '/') return landingPage(env);
     if (request.method === 'GET' && url.pathname === CALLBACK_PATH) {
       return handleOAuthCallback(request, env).catch(errorPage);
     }
@@ -82,9 +83,10 @@ function handleCommand(interaction: any, env: Env, ctx: ExecutionContext, origin
 
         const installs = await listUserInstallations(token);
         if (installs.length === 0) {
-          return message(
+          return withInstallLink(
             '⚠️ あんたが権限を持つリポジトリに、この GitHub App がインストールされていないよ。\n' +
-              'リポジトリの管理者に App をインストールしてもらうか、`/issue-unlink` で別の GitHub アカウントに連携し直してね。',
+              '下のボタンから App をインストールして（リポジトリのオーナーだけができるよ）、もう一度 `/issue` を実行してね。\n' +
+              '別の GitHub アカウントを使いたいなら、`/issue-unlink` で連携を解除してから連携し直してね。',
           );
         }
         if (installs.length === 1) {
@@ -291,7 +293,12 @@ async function startRepoStep(
   count: number,
 ): Promise<MessageBody> {
   const repos = await listUserRepositories(token, installationId);
-  if (repos.length === 0) return message('⚠️ このインストール先には、あんたが issue を作れるリポジトリがないよ…');
+  if (repos.length === 0) {
+    return withInstallLink(
+      '⚠️ このインストール先には、あんたが issue を作れるリポジトリがないよ…\n' +
+        '使いたいリポジトリが App の対象に入っていないなら、下のボタンから追加して、もう一度 `/issue` を実行してね。',
+    );
+  }
 
   const session: SessionOf<'repo'> = { step: 'repo', installationId, repos, page: 0, count };
   await setSession(env.KV, sessionId, session);
@@ -332,6 +339,26 @@ async function createIssueFromPreview(
 // embeds を明示的に空にしないと、プレビューの Embed が後続の編集後も残る
 function message(content: string): MessageBody {
   return { content, components: [], embeds: [] };
+}
+
+function withInstallLink(content: string): MessageBody {
+  return {
+    content,
+    components: [
+      {
+        type: MessageComponentTypes.ACTION_ROW,
+        components: [
+          {
+            type: MessageComponentTypes.BUTTON,
+            style: ButtonStyleTypes.LINK,
+            label: 'GitHub App をインストールする',
+            url: GITHUB_APP_INSTALL_URL,
+          },
+        ],
+      },
+    ],
+    embeds: [],
+  };
 }
 
 function updateMessage(body: MessageBody): Response {
