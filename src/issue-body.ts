@@ -8,7 +8,8 @@ const TRUNCATED_MARK = '…（長いため省略。全文はリンク先の Disc
 export function buildIssueBody(summary: string, messages: MessageEntry[]): string {
   const head = [truncate(escapeMentions(summary), SUMMARY_LIMIT), '', '## 元チャット', '', ''].join('\n');
   const contents = messages.map((m) => escapeMentions(m.content));
-  const render = (cap: number) => head + sourceChatDetails(messages, contents, cap);
+  const footer = `\n\n---\n<sub>🤖 [Discord の会話](${messages[0].url}) から issue-discordbot で作成</sub>`;
+  const render = (cap: number) => head + sourceChatDetails(messages, contents, cap) + footer;
 
   const full = render(Infinity);
   if (full.length <= BODY_LIMIT) return full;

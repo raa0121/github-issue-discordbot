@@ -1,4 +1,3 @@
-import type { App } from '@octokit/app';
 import {
   ButtonStyleTypes,
   InteractionResponseFlags,
@@ -9,10 +8,22 @@ import {
 } from 'discord-interactions';
 import { editOriginalResponse, jsonResponse, verifyDiscordRequest } from './discord.js';
 import type { Env } from './env.js';
-import { createGitHubApp, createIssue, listInstallations, listRepositories } from './github.js';
+import { createIssue, listUserInstallations, listUserRepositories } from './github.js';
 import { buildIssueBody } from './issue-body.js';
+import {
+  CALLBACK_PATH,
+  CONFIRM_PATH,
+  DiscordUser,
+  authorizeUrl,
+  createOAuthState,
+  deleteLink,
+  getLink,
+  getUserToken,
+  revokeToken,
+} from './oauth.js';
 import { summarize } from './summarize.js';
 import { deleteSession, getSession, setSession, MessageEntry, RepoInfo, SessionOf } from './session.js';
+import { errorPage, handleOAuthCallback, handleOAuthConfirm } from './web.js';
 
 const PAGE_SIZE = 25;
 const DEFAULT_COUNT = 20;
@@ -23,6 +34,13 @@ type TargetRepo = RepoInfo & { installationId: number };
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === 'GET' && url.pathname === CALLBACK_PATH) {
+      return handleOAuthCallback(request, env).catch(errorPage);
+    }
+    if (request.method === 'POST' && url.pathname === CONFIRM_PATH) {
+      return handleOAuthConfirm(request, env).catch(errorPage);
+    }
     if (request.method !== 'POST') return jsonResponse({ error: 'Method Not Allowed' }, 405);
 
     const interaction = await verifyDiscordRequest(request, env);
@@ -32,7 +50,7 @@ export default {
       case InteractionType.PING:
         return jsonResponse({ type: InteractionResponseType.PONG });
       case InteractionType.APPLICATION_COMMAND:
-        return handleCommand(interaction, env, ctx);
+        return handleCommand(interaction, env, ctx, url.origin);
       case InteractionType.MESSAGE_COMPONENT:
         return handleComponent(interaction, env, ctx);
       case InteractionType.MODAL_SUBMIT:
@@ -45,50 +63,69 @@ export default {
 
 // ---------- インタラクション処理 ----------
 
-function handleCommand(interaction: any, env: Env, ctx: ExecutionContext): Response {
-  if (interaction.data.name !== 'issue') {
-    return jsonResponse({
-      type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-      data: { content: '未対応のコマンドだよ…', flags: InteractionResponseFlags.EPHEMERAL },
-    });
-  }
-
-  const countOption = interaction.data.options?.find((o: { name: string }) => o.name === 'count')?.value;
-  const count = Math.min(MAX_COUNT, Math.max(1, Number(countOption ?? DEFAULT_COUNT)));
-  const sessionId = crypto.randomUUID();
-
+function handleCommand(interaction: any, env: Env, ctx: ExecutionContext, origin: string): Response {
   const deferred = jsonResponse({
     type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
     data: { flags: InteractionResponseFlags.EPHEMERAL },
   });
+  const user = discordUser(interaction);
 
-  return respondThenEdit(deferred, ctx, env, interaction.token, async () => {
-    const app = createGitHubApp(env);
-    const installs = await listInstallations(app);
-    if (installs.length === 0) {
-      return message('⚠️ GitHub App がまだインストールされていないよ！インストールしてからもう一度試してね。');
-    }
-    if (installs.length === 1) {
-      return startRepoStep(env, app, sessionId, installs[0].id, count);
+  switch (interaction.data.name) {
+    case 'issue': {
+      const countOption = interaction.data.options?.find((o: { name: string }) => o.name === 'count')?.value;
+      const count = Math.min(MAX_COUNT, Math.max(1, Number(countOption ?? DEFAULT_COUNT)));
+      const sessionId = crypto.randomUUID();
+
+      return respondThenEdit(deferred, ctx, env, interaction.token, async () => {
+        const token = await getUserToken(env, user.id);
+        if (!token) return linkPrompt(env, origin, user);
+
+        const installs = await listUserInstallations(token);
+        if (installs.length === 0) {
+          return message(
+            '⚠️ あんたが権限を持つリポジトリに、この GitHub App がインストールされていないよ。\n' +
+              'リポジトリの管理者に App をインストールしてもらうか、`/issue-unlink` で別の GitHub アカウントに連携し直してね。',
+          );
+        }
+        if (installs.length === 1) {
+          return startRepoStep(env, token, sessionId, installs[0].id, count);
+        }
+
+        const session: SessionOf<'install'> = { step: 'install', installs, count };
+        await setSession(env.KV, sessionId, session);
+        return installMessage(session, sessionId);
+      });
     }
 
-    const session: SessionOf<'install'> = { step: 'install', installs, count };
-    await setSession(env.KV, sessionId, session);
-    return installMessage(session, sessionId);
-  });
+    case 'issue-unlink':
+      return respondThenEdit(deferred, ctx, env, interaction.token, async () => {
+        const link = await getLink(env.KV, user.id);
+        if (!link) return message('GitHub アカウントはまだ連携されていないよ。');
+        await revokeToken(env, link.accessToken).catch((err) => console.error(err));
+        await deleteLink(env.KV, user.id);
+        return message(`GitHub アカウント **${link.githubLogin}** との連携を解除したよ。`);
+      });
+
+    default:
+      return jsonResponse({
+        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
+        data: { content: '未対応のコマンドだよ…', flags: InteractionResponseFlags.EPHEMERAL },
+      });
+  }
 }
 
 async function handleComponent(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const [kind, sessionId, arg] = (interaction.data.custom_id as string).split(':');
   const session = await getSession(env.KV, sessionId);
   const expired = updateMessage(message('セッションが期限切れだよ…もう一度 `/issue` してね。'));
+  const userId = discordUser(interaction).id;
 
   switch (kind) {
     case 'install_select': {
       if (session?.step !== 'install') return expired;
       const installationId = Number(interaction.data.values[0]);
       return respondThenEdit(updateMessage(message('📚 リポジトリを読み込み中だよ…')), ctx, env, interaction.token, () =>
-        startRepoStep(env, createGitHubApp(env), sessionId, installationId, session.count),
+        withUserToken(env, userId, (token) => startRepoStep(env, token, sessionId, installationId, session.count)),
       );
     }
 
@@ -135,7 +172,7 @@ async function handleComponent(interaction: any, env: Env, ctx: ExecutionContext
     case 'issue_create': {
       if (session?.step !== 'preview') return expired;
       return respondThenEdit(updateMessage(message('📝 issue を作成中だよ…')), ctx, env, interaction.token, () =>
-        createIssueFromPreview(env, sessionId, session),
+        withUserToken(env, userId, (token) => createIssueFromPreview(env, token, sessionId, session)),
       );
     }
 
@@ -207,15 +244,54 @@ function respondThenEdit(
   return initial;
 }
 
+function discordUser(interaction: any): DiscordUser {
+  // サーバー内では member.user、DM では user に入っている
+  const user = interaction.member?.user ?? interaction.user;
+  return { id: user.id, name: user.global_name ? `${user.global_name} (@${user.username})` : `@${user.username}` };
+}
+
+async function withUserToken(
+  env: Env,
+  discordUserId: string,
+  fn: (token: string) => Promise<MessageBody>,
+): Promise<MessageBody> {
+  const token = await getUserToken(env, discordUserId);
+  if (!token) return message('GitHub との連携が切れたよ…もう一度 `/issue` からやり直してね。');
+  return fn(token);
+}
+
+async function linkPrompt(env: Env, origin: string, user: DiscordUser): Promise<MessageBody> {
+  const state = await createOAuthState(env.KV, user);
+  return {
+    content:
+      'issue を作るには、まず GitHub アカウントとの連携が必要だよ。\n' +
+      '下のボタンから GitHub で認可して、連携できたらもう一度 `/issue` を実行してね。（リンクは 10 分間有効だよ）',
+    components: [
+      {
+        type: MessageComponentTypes.ACTION_ROW,
+        components: [
+          {
+            type: MessageComponentTypes.BUTTON,
+            style: ButtonStyleTypes.LINK,
+            label: 'GitHub と連携する',
+            url: authorizeUrl(env, state, origin + CALLBACK_PATH),
+          },
+        ],
+      },
+    ],
+    embeds: [],
+  };
+}
+
 async function startRepoStep(
   env: Env,
-  app: App,
+  token: string,
   sessionId: string,
   installationId: number,
   count: number,
 ): Promise<MessageBody> {
-  const repos = await listRepositories(app, installationId);
-  if (repos.length === 0) return message('⚠️ この GitHub App がアクセスできるリポジトリがないよ…');
+  const repos = await listUserRepositories(token, installationId);
+  if (repos.length === 0) return message('⚠️ このインストール先には、あんたが issue を作れるリポジトリがないよ…');
 
   const session: SessionOf<'repo'> = { step: 'repo', installationId, repos, page: 0, count };
   await setSession(env.KV, sessionId, session);
@@ -240,12 +316,13 @@ async function summarizeToPreview(
 
 async function createIssueFromPreview(
   env: Env,
+  token: string,
   sessionId: string,
   session: SessionOf<'preview'>,
 ): Promise<MessageBody> {
   const { repo } = session;
   const issueBody = buildIssueBody(session.body, session.messages);
-  const url = await createIssue(createGitHubApp(env), repo.installationId, repo.owner, repo.name, session.title, issueBody);
+  const url = await createIssue(token, repo.owner, repo.name, session.title, issueBody);
   await deleteSession(env.KV, sessionId);
   return message(`🎉 **${repo.fullName}** に issue を作成したよ！\n${url}`);
 }

@@ -21,6 +21,12 @@ const commands = [
       },
     ],
   },
+  {
+    name: 'issue-unlink',
+    description: 'GitHub アカウントとの連携を解除します',
+    type: 1,
+    contexts: [0],
+  },
 ];
 
 const res = await fetch(`https://discord.com/api/v10/applications/${DISCORD_APPLICATION_ID}/commands`, {
