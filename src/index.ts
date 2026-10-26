@@ -23,6 +23,7 @@ import {
   DiscordUser,
   authorizeUrl,
   createOAuthState,
+  deleteExpiredLinks,
   deleteLink,
   getLink,
   getUserToken,
@@ -66,6 +67,11 @@ export default {
         return jsonResponse({ error: 'Not handled' }, 400);
     }
   },
+
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    const deleted = await deleteExpiredLinks(env);
+    console.log(`期限切れの連携情報を ${deleted} 件削除したよ`);
+  },
 };
 
 // ---------- インタラクション処理 ----------
@@ -107,10 +113,10 @@ function handleCommand(interaction: any, env: Env, ctx: ExecutionContext, origin
 
     case 'issue-unlink':
       return respondThenEdit(deferred, ctx, env, interaction.token, async () => {
-        const link = await getLink(env.KV, user.id);
+        const link = await getLink(env, user.id);
         if (!link) return message('GitHub アカウントはまだ連携されていないよ。');
         await revokeToken(env, link.accessToken).catch((err) => console.error(err));
-        await deleteLink(env.KV, user.id);
+        await deleteLink(env, user.id);
         return message(`GitHub アカウント **${link.githubLogin}** との連携を解除したよ。`);
       });
 

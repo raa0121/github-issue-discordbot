@@ -58,7 +58,7 @@ export async function handleOAuthConfirm(request: Request, env: Env): Promise<Re
     return page('連携しなかったよ', '<p>アカウントは連携していないよ。このページは閉じて大丈夫。</p>');
   }
 
-  await saveLink(env.KV, pending.discordUser.id, pending.link);
+  await saveLink(env, pending.discordUser.id, pending.link);
   return page(
     '連携できたよ！',
     `<p>GitHub の <strong>${escapeHtml(pending.link.githubLogin)}</strong> と連携したよ。Discord に戻って、もう一度 <code>/issue</code> を実行してね。</p>

@@ -21,3 +21,13 @@ binding = "AI"
 [[kv_namespaces]]
 binding = "KV"
 id = "edc38ab2d02f4e2e9ed565f051cf2b52"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "discord-issue-bot"
+database_id = "058e4e61-30a7-4ee4-b2b3-cc96920031ea"
+migrations_dir = "migrations"
+
+# cron は UTC で指定する。JST の毎日 3:00
+[triggers]
+crons = ["0 18 * * *"]

@@ -105,41 +105,108 @@ async function consume<T>(kv: KVNamespace, key: string): Promise<T | null> {
   return JSON.parse(raw);
 }
 
-export async function getLink(kv: KVNamespace, discordUserId: string): Promise<UserLink | null> {
-  const raw = await kv.get(`user:${discordUserId}`);
-  return raw ? JSON.parse(raw) : null;
+// ---------- D1（連携情報） ----------
+// 連携情報は KV に置くと、別の拠点で「無い」とキャッシュされた結果が連携直後も残り、連携し直しを求めてしまう。
+// D1 は書き込み直後からどの拠点でも読めるのでこちらに置く
+
+type LinkRow = {
+  github_id: number;
+  github_login: string;
+  access_token: string;
+  expires_at: number | null;
+  refresh_token: string | null;
+  refresh_expires_at: number | null;
+};
+
+export async function getLink(env: Env, discordUserId: string): Promise<UserLink | null> {
+  const row = await env.DB.prepare(
+    `SELECT github_id, github_login, access_token, expires_at, refresh_token, refresh_expires_at
+       FROM user_links WHERE discord_user_id = ?`,
+  )
+    .bind(discordUserId)
+    .first<LinkRow>();
+  if (!row) return migrateLinkFromKv(env, discordUserId);
+  return {
+    githubId: row.github_id,
+    githubLogin: row.github_login,
+    accessToken: row.access_token,
+    expiresAt: row.expires_at ?? undefined,
+    refreshToken: row.refresh_token ?? undefined,
+    refreshExpiresAt: row.refresh_expires_at ?? undefined,
+  };
 }
 
-export async function saveLink(kv: KVNamespace, discordUserId: string, link: UserLink): Promise<void> {
-  // リフレッシュトークンが切れたら連携は使えないので、同じタイミングで KV からも消えるようにする
-  const ttl = link.refreshExpiresAt ? Math.floor((link.refreshExpiresAt - Date.now()) / 1000) : undefined;
-  await kv.put(`user:${discordUserId}`, JSON.stringify(link), ttl ? { expirationTtl: Math.max(60, ttl) } : undefined);
+export async function saveLink(env: Env, discordUserId: string, link: UserLink): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO user_links
+       (discord_user_id, github_id, github_login, access_token, expires_at, refresh_token, refresh_expires_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (discord_user_id) DO UPDATE SET
+       github_id = excluded.github_id,
+       github_login = excluded.github_login,
+       access_token = excluded.access_token,
+       expires_at = excluded.expires_at,
+       refresh_token = excluded.refresh_token,
+       refresh_expires_at = excluded.refresh_expires_at,
+       updated_at = excluded.updated_at`,
+  )
+    .bind(
+      discordUserId,
+      link.githubId,
+      link.githubLogin,
+      link.accessToken,
+      link.expiresAt ?? null,
+      link.refreshToken ?? null,
+      link.refreshExpiresAt ?? null,
+      Date.now(),
+    )
+    .run();
 }
 
-export async function deleteLink(kv: KVNamespace, discordUserId: string): Promise<void> {
-  await kv.delete(`user:${discordUserId}`);
+export async function deleteLink(env: Env, discordUserId: string): Promise<void> {
+  await env.DB.prepare('DELETE FROM user_links WHERE discord_user_id = ?').bind(discordUserId).run();
+  await env.KV.delete(`user:${discordUserId}`);
+}
+
+// リフレッシュトークンまで切れた連携は二度と使えないので消す。期限のないトークンの行は残す
+export async function deleteExpiredLinks(env: Env): Promise<number> {
+  const result = await env.DB.prepare('DELETE FROM user_links WHERE COALESCE(refresh_expires_at, expires_at) < ?')
+    .bind(Date.now())
+    .run();
+  return result.meta.changes;
+}
+
+// KV の user:<id> には D1 導入前に連携したユーザーの情報が残っている。次に使われたときに D1 へ移す。
+// KV 側はリフレッシュトークンの期限（約半年）で自動的に消えるので、2027 年 5 月以降はこの処理ごと消してよい
+async function migrateLinkFromKv(env: Env, discordUserId: string): Promise<UserLink | null> {
+  const raw = await env.KV.get(`user:${discordUserId}`);
+  if (!raw) return null;
+  const link = JSON.parse(raw) as UserLink;
+  await saveLink(env, discordUserId, link);
+  await env.KV.delete(`user:${discordUserId}`);
+  return link;
 }
 
 // 連携がない、または更新できなくなった場合は null を返す
 export async function getUserToken(env: Env, discordUserId: string): Promise<string | null> {
-  const link = await getLink(env.KV, discordUserId);
+  const link = await getLink(env, discordUserId);
   if (!link) return null;
   if (!link.expiresAt || link.expiresAt - Date.now() > REFRESH_MARGIN_MS) return link.accessToken;
-  if (!link.refreshToken) {
-    await deleteLink(env.KV, discordUserId);
+  if (!link.refreshToken || (link.refreshExpiresAt && link.refreshExpiresAt < Date.now())) {
+    await deleteLink(env, discordUserId);
     return null;
   }
 
   try {
     const tokens = await tokenRequest(env, { grant_type: 'refresh_token', refresh_token: link.refreshToken });
-    await saveLink(env.KV, discordUserId, { ...link, ...tokens });
+    await saveLink(env, discordUserId, { ...link, ...tokens });
     return tokens.accessToken;
   } catch (err) {
     console.error(err);
     // リフレッシュトークンは使い捨てなので、同時に走った別リクエストが先に更新していればそちらを使う
-    const latest = await getLink(env.KV, discordUserId);
+    const latest = await getLink(env, discordUserId);
     if (latest && latest.accessToken !== link.accessToken) return latest.accessToken;
-    await deleteLink(env.KV, discordUserId);
+    await deleteLink(env, discordUserId);
     return null;
   }
 }
