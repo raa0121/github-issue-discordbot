@@ -8,6 +8,13 @@ DISCORD_APPLICATION_ID = "815097353228910643"
 DISCORD_PUBLIC_KEY = "ae50150a5c0e8cda2cfdd980e329685560a89eb8f863ebf106ca786943c51ce4"
 GITHUB_CLIENT_ID = "Iv23lip7ojqobhLDXY37"
 
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
 [ai]
 binding = "AI"
 

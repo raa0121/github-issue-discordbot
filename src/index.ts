@@ -8,7 +8,14 @@ import {
 } from 'discord-interactions';
 import { editOriginalResponse, jsonResponse, verifyDiscordRequest } from './discord.js';
 import type { Env } from './env.js';
-import { GITHUB_APP_INSTALL_URL, createIssue, listUserInstallations, listUserRepositories } from './github.js';
+import {
+  GITHUB_APP_INSTALL_URL,
+  createIssue,
+  describeTemplate,
+  listIssueTemplates,
+  listUserInstallations,
+  listUserRepositories,
+} from './github.js';
 import { buildIssueBody } from './issue-body.js';
 import {
   CALLBACK_PATH,
@@ -22,7 +29,7 @@ import {
   revokeToken,
 } from './oauth.js';
 import { summarize } from './summarize.js';
-import { deleteSession, getSession, setSession, MessageEntry, RepoInfo, SessionOf } from './session.js';
+import { deleteSession, getSession, setSession, MessageEntry, SessionOf } from './session.js';
 import { errorPage, handleOAuthCallback, handleOAuthConfirm, landingPage } from './web.js';
 
 const PAGE_SIZE = 25;
@@ -30,7 +37,6 @@ const DEFAULT_COUNT = 20;
 const MAX_COUNT = 25;
 
 type MessageBody = { content: string; components: object[]; embeds?: object[] };
-type TargetRepo = RepoInfo & { installationId: number };
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -143,14 +149,49 @@ async function handleComponent(interaction: any, env: Env, ctx: ExecutionContext
       if (session?.step !== 'repo') return expired;
       const [owner, name] = (interaction.data.values[0] as string).split('/');
       const repo = { owner, name, fullName: `${owner}/${name}`, installationId: session.installationId };
-      return respondThenEdit(updateMessage(message('💬 メッセージを読み込み中だよ…')), ctx, env, interaction.token, async () => {
-        const messages = await fetchRecentMessages(env, interaction.channel_id, interaction.guild_id, session.count);
-        if (messages.length === 0) return message('メッセージが見つからなかったよ…');
+      const loading = updateMessage(message('💬 メッセージとテンプレートを読み込み中だよ…'));
+      return respondThenEdit(loading, ctx, env, interaction.token, () =>
+        withUserToken(env, userId, async (token) => {
+          const [messages, { source, templates }] = await Promise.all([
+            fetchRecentMessages(env, interaction.channel_id, interaction.guild_id, session.count),
+            // テンプレートは要約の質を上げるための補助なので、読めなくても issue 作成は止めない
+            listIssueTemplates(token, owner, name).catch((err) => {
+              console.error(err);
+              return { source: null, templates: [] };
+            }),
+          ]);
+          if (messages.length === 0) return message('メッセージが見つからなかったよ…');
 
-        const next: SessionOf<'messages'> = { step: 'messages', repo, messages };
-        await setSession(env.KV, sessionId, next);
-        return messageSelectMessage(next, sessionId);
-      });
+          if (templates.length >= 2) {
+            const next: SessionOf<'template'> = { step: 'template', repo, messages, templates, templateSource: source };
+            await setSession(env.KV, sessionId, next);
+            return templateSelectMessage(next, sessionId);
+          }
+          const next: SessionOf<'messages'> = { step: 'messages', repo, messages, templates, templateSource: source };
+          await setSession(env.KV, sessionId, next);
+          return messageSelectMessage(next, sessionId);
+        }),
+      );
+    }
+
+    case 'template_select': {
+      if (session?.step !== 'template') return expired;
+      const choice = interaction.data.values[0] as string;
+      const templates =
+        choice === TEMPLATE_AUTO
+          ? session.templates
+          : choice === TEMPLATE_NONE
+            ? []
+            : session.templates.filter((_, i) => String(i) === choice);
+      const next: SessionOf<'messages'> = {
+        step: 'messages',
+        repo: session.repo,
+        messages: session.messages,
+        templates,
+        templateSource: templates.length > 0 ? session.templateSource : null,
+      };
+      await setSession(env.KV, sessionId, next);
+      return updateMessage(messageSelectMessage(next, sessionId));
     }
 
     case 'msg_select': {
@@ -160,14 +201,14 @@ async function handleComponent(interaction: any, env: Env, ctx: ExecutionContext
         .filter((m) => selectedIds.has(m.id))
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
       return respondThenEdit(updateMessage(message('🧠 要約中だよ…')), ctx, env, interaction.token, () =>
-        summarizeToPreview(env, sessionId, session.repo, selected),
+        summarizeToPreview(env, sessionId, { ...session, messages: selected }),
       );
     }
 
     case 'issue_regen': {
       if (session?.step !== 'preview') return expired;
       return respondThenEdit(updateMessage(message('🔄 要約し直してるよ…')), ctx, env, interaction.token, () =>
-        summarizeToPreview(env, sessionId, session.repo, session.messages),
+        summarizeToPreview(env, sessionId, session),
       );
     }
 
@@ -308,15 +349,14 @@ async function startRepoStep(
 async function summarizeToPreview(
   env: Env,
   sessionId: string,
-  repo: TargetRepo,
-  messages: MessageEntry[],
+  { repo, messages, templates, templateSource }: Omit<SessionOf<'messages'>, 'step'>,
 ): Promise<MessageBody> {
   const transcript = messages
     .map((m, i) => `[${i + 1}] ${m.author} (${m.createdAt})\n${m.content}\n🔗 ${m.url}`)
     .join('\n\n');
 
-  const { title, body } = await summarize(env.AI, transcript);
-  const session: SessionOf<'preview'> = { step: 'preview', repo, messages, title, body };
+  const { title, body } = await summarize(env.AI, transcript, templates);
+  const session: SessionOf<'preview'> = { step: 'preview', repo, messages, title, body, templates, templateSource };
   await setSession(env.KV, sessionId, session);
   return previewMessage(session, sessionId);
 }
@@ -419,6 +459,43 @@ function repoMessage(session: SessionOf<'repo'>, sessionId: string): MessageBody
   return { content: `リポジトリを選んでね（${session.page + 1} / ${pages} ページ）`, components };
 }
 
+const TEMPLATE_AUTO = 'auto';
+const TEMPLATE_NONE = 'none';
+
+function templateSelectMessage(session: SessionOf<'template'>, sessionId: string): MessageBody {
+  const sourceNote = session.templateSource && session.templateSource !== 'repo' ? `（${session.templateSource} の既定）` : '';
+  return {
+    content: `**${session.repo.fullName}** の issue テンプレート${sourceNote}を選んでね！`,
+    components: [
+      selectRow({
+        custom_id: `template_select:${sessionId}`,
+        placeholder: 'テンプレートを選んでね',
+        options: [
+          { label: '🤖 AI に任せる', value: TEMPLATE_AUTO, description: '会話の内容に一番合うテンプレートを AI が選ぶよ' },
+          ...session.templates.map((t, i) => {
+            const { name, description } = describeTemplate(t);
+            return {
+              label: truncate(name, 100),
+              value: String(i),
+              ...(description ? { description: truncate(description, 100) } : {}),
+            };
+          }),
+          { label: 'テンプレートを使わない', value: TEMPLATE_NONE, description: '議題・決定事項・次のアクションの形で要約するよ' },
+        ],
+      }),
+    ],
+  };
+}
+
+function templateNote(session: SessionOf<'preview'>): string {
+  const { templates, templateSource } = session;
+  if (templates.length === 0) return '';
+  const where = templateSource && templateSource !== 'repo' ? `（${templateSource}）` : '';
+  return templates.length === 1
+    ? `テンプレート「${describeTemplate(templates[0]).name}」${where}に沿って書いたよ`
+    : `テンプレート ${templates.length} 件${where}から AI が選んだよ`;
+}
+
 function messageSelectMessage(session: SessionOf<'messages'>, sessionId: string): MessageBody {
   return {
     content: `**${session.repo.fullName}** に issue を立てるよ！\n直近 **${session.messages.length}件** から要約したいメッセージを選んでね。`,
@@ -452,7 +529,11 @@ function previewMessage(session: SessionOf<'preview'>, sessionId: string): Messa
       {
         title: truncate(session.title, 256),
         description: truncate(session.body, 4096),
-        footer: { text: `元チャット ${session.messages.length} 件は issue 本文に折りたたんで添付するよ` },
+        footer: {
+          text: [`元チャット ${session.messages.length} 件は issue 本文に折りたたんで添付するよ`, templateNote(session)]
+            .filter(Boolean)
+            .join(' / '),
+        },
       },
     ],
     components: [
@@ -503,7 +584,18 @@ async function fetchRecentMessages(
   const res = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages?limit=${limit}`, {
     headers: { Authorization: `Bot ${env.DISCORD_TOKEN}` },
   });
-  if (!res.ok) throw new Error(`Discord API エラー: ${res.status}`);
+  if (!res.ok) {
+    const error = (await res.json().catch(() => ({}))) as { code?: number; message?: string };
+    // 50001: Missing Access（チャンネルが見えない）、50013: Missing Permissions（履歴を読めない）
+    if (error.code === 50001 || error.code === 50013) {
+      throw new Error(
+        'Bot がこのチャンネルのメッセージを読めないよ。\n' +
+          'チャンネルの設定 →「権限」で、Bot に「チャンネルを見る」と「メッセージ履歴を読む」を許可してね。' +
+          '非公開スレッドの場合は、スレッドに Bot を追加してね。',
+      );
+    }
+    throw new Error(`Discord API エラー: ${res.status} ${error.message ?? ''}`.trim());
+  }
   const data: any[] = await res.json();
   return data
     .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
