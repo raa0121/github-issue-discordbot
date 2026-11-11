@@ -1,4 +1,4 @@
-import type { InstallInfo, RepoInfo } from './session.js';
+import type { InstallInfo, IssueRef, IssueSummary, RepoInfo } from './session.js';
 
 export const GITHUB_APP_INSTALL_URL = 'https://github.com/apps/issue-discordbot/installations/new';
 
@@ -161,8 +161,61 @@ async function readTemplateFiles(
   return templates.filter((t): t is IssueTemplate => t !== null);
 }
 
+function repoPath(owner: string, repo: string): string {
+  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+}
+
 export async function createIssue(token: string, owner: string, repo: string, title: string, body: string): Promise<string> {
-  const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues`;
-  const issue = await github<{ html_url: string }>(token, 'POST', path, { title, body });
+  const issue = await github<{ html_url: string }>(token, 'POST', `${repoPath(owner, repo)}/issues`, { title, body });
   return issue.html_url;
+}
+
+type ApiIssue = {
+  number: number;
+  title: string;
+  body: string | null;
+  html_url: string;
+  updated_at: string;
+  pull_request?: unknown;
+};
+
+// issues API は PR も issue として返す。PR かどうかは pull_request の有無で分かる
+export async function getIssue(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<(IssueRef & { isPullRequest: boolean }) | null> {
+  const res = await githubFetch(token, 'GET', `${repoPath(owner, repo)}/issues/${number}`);
+  // 410 は削除された issue
+  if (res.status === 404 || res.status === 410) return null;
+  if (!res.ok) throw new Error(`GitHub API エラー: ${res.status} ${await res.text()}`);
+  const issue = (await res.json()) as ApiIssue;
+  return {
+    number: issue.number,
+    title: issue.title,
+    body: issue.body ?? '',
+    url: issue.html_url,
+    isPullRequest: issue.pull_request !== undefined,
+  };
+}
+
+// Discord のセレクトメニューに出せるのは 25 件まで。PR を除いた分が減るので多めに取る
+export async function listOpenIssues(token: string, owner: string, repo: string): Promise<IssueSummary[]> {
+  const issues = await github<ApiIssue[]>(
+    token,
+    'GET',
+    `${repoPath(owner, repo)}/issues?state=open&sort=updated&direction=desc&per_page=50`,
+  );
+  return issues
+    .filter((i) => i.pull_request === undefined)
+    .slice(0, 25)
+    .map((i) => ({ number: i.number, title: i.title, updatedAt: i.updated_at }));
+}
+
+export async function createComment(token: string, owner: string, repo: string, number: number, body: string): Promise<string> {
+  const comment = await github<{ html_url: string }>(token, 'POST', `${repoPath(owner, repo)}/issues/${number}/comments`, {
+    body,
+  });
+  return comment.html_url;
 }

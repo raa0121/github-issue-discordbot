@@ -52,7 +52,7 @@ function sourceChatDetails(messages: MessageEntry[], contents: string[], cap: nu
   ].join('\n');
 }
 
-function formatJst(iso: string): string {
+export function formatJst(iso: string): string {
   return new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', dateStyle: 'short', timeStyle: 'short' });
 }
 

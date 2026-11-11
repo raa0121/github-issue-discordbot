@@ -10,13 +10,16 @@ import { editOriginalResponse, jsonResponse, verifyDiscordRequest } from './disc
 import type { Env } from './env.js';
 import {
   GITHUB_APP_INSTALL_URL,
+  createComment,
   createIssue,
   describeTemplate,
+  getIssue,
   listIssueTemplates,
+  listOpenIssues,
   listUserInstallations,
   listUserRepositories,
 } from './github.js';
-import { buildIssueBody } from './issue-body.js';
+import { buildIssueBody, formatJst } from './issue-body.js';
 import {
   CALLBACK_PATH,
   CONFIRM_PATH,
@@ -29,8 +32,17 @@ import {
   getUserToken,
   revokeToken,
 } from './oauth.js';
-import { summarize } from './summarize.js';
-import { deleteSession, getSession, setSession, MessageEntry, SessionOf } from './session.js';
+import { summarize, summarizeForComment } from './summarize.js';
+import {
+  deleteSession,
+  getSession,
+  setSession,
+  IssueRef,
+  MessageEntry,
+  Purpose,
+  RepoInfo,
+  SessionOf,
+} from './session.js';
 import { errorPage, handleOAuthCallback, handleOAuthConfirm, landingPage } from './web.js';
 
 const PAGE_SIZE = 25;
@@ -84,28 +96,35 @@ function handleCommand(interaction: any, env: Env, ctx: ExecutionContext, origin
   const user = discordUser(interaction);
 
   switch (interaction.data.name) {
-    case 'issue': {
-      const countOption = interaction.data.options?.find((o: { name: string }) => o.name === 'count')?.value;
+    case 'issue':
+    case 'issue-comment': {
+      const purpose: Purpose = interaction.data.name === 'issue' ? 'issue' : 'comment';
+      const command = commandOf(purpose);
+      const countOption = commandOption(interaction, 'count');
       const count = Math.min(MAX_COUNT, Math.max(1, Number(countOption ?? DEFAULT_COUNT)));
+      const issueOption = commandOption(interaction, 'issue');
       const sessionId = crypto.randomUUID();
 
       return respondThenEdit(deferred, ctx, env, interaction.token, async () => {
         const token = await getUserToken(env, user.id);
-        if (!token) return linkPrompt(env, origin, user);
+        if (!token) return linkPrompt(env, origin, user, command);
+        if (typeof issueOption === 'string') {
+          return startCommentFromRef(env, interaction, token, sessionId, issueOption, count);
+        }
 
         const installs = await listUserInstallations(token);
         if (installs.length === 0) {
           return withInstallLink(
             '⚠️ あんたが権限を持つリポジトリに、この GitHub App がインストールされていないよ。\n' +
-              '下のボタンから App をインストールして（リポジトリのオーナーだけができるよ）、もう一度 `/issue` を実行してね。\n' +
+              `下のボタンから App をインストールして（リポジトリのオーナーだけができるよ）、もう一度 \`${command}\` を実行してね。\n` +
               '別の GitHub アカウントを使いたいなら、`/issue-unlink` で連携を解除してから連携し直してね。',
           );
         }
         if (installs.length === 1) {
-          return startRepoStep(env, token, sessionId, installs[0].id, count);
+          return startRepoStep(env, token, sessionId, installs[0].id, count, purpose);
         }
 
-        const session: SessionOf<'install'> = { step: 'install', installs, count };
+        const session: SessionOf<'install'> = { step: 'install', installs, count, purpose };
         await setSession(env.KV, sessionId, session);
         return installMessage(session, sessionId);
       });
@@ -131,7 +150,7 @@ function handleCommand(interaction: any, env: Env, ctx: ExecutionContext, origin
 async function handleComponent(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const [kind, sessionId, arg] = (interaction.data.custom_id as string).split(':');
   const session = await getSession(env.KV, sessionId);
-  const expired = updateMessage(message('セッションが期限切れだよ…もう一度 `/issue` してね。'));
+  const expired = updateMessage(message(EXPIRED_MESSAGE));
   const userId = discordUser(interaction).id;
 
   switch (kind) {
@@ -139,7 +158,9 @@ async function handleComponent(interaction: any, env: Env, ctx: ExecutionContext
       if (session?.step !== 'install') return expired;
       const installationId = Number(interaction.data.values[0]);
       return respondThenEdit(updateMessage(message('📚 リポジトリを読み込み中だよ…')), ctx, env, interaction.token, () =>
-        withUserToken(env, userId, (token) => startRepoStep(env, token, sessionId, installationId, session.count)),
+        withUserToken(env, userId, (token) =>
+          startRepoStep(env, token, sessionId, installationId, session.count, session.purpose),
+        ),
       );
     }
 
@@ -154,6 +175,24 @@ async function handleComponent(interaction: any, env: Env, ctx: ExecutionContext
     case 'repo_select': {
       if (session?.step !== 'repo') return expired;
       const [owner, name] = (interaction.data.values[0] as string).split('/');
+      if (session.purpose === 'comment') {
+        const repo: RepoInfo = { owner, name, fullName: `${owner}/${name}` };
+        return respondThenEdit(updateMessage(message('📋 issue を読み込み中だよ…')), ctx, env, interaction.token, () =>
+          withUserToken(env, userId, async (token) => {
+            const issues = await listOpenIssues(token, owner, name);
+            if (issues.length === 0) {
+              return message(
+                `**${repo.fullName}** には開いている issue がないよ。\n` +
+                  '閉じた issue にコメントしたいなら、`/issue-comment issue:<issue の URL>` で指定してね。',
+              );
+            }
+            const next: SessionOf<'issue_pick'> = { step: 'issue_pick', repo, issues, count: session.count };
+            await setSession(env.KV, sessionId, next);
+            return issuePickMessage(next, sessionId);
+          }),
+        );
+      }
+
       const repo = { owner, name, fullName: `${owner}/${name}`, installationId: session.installationId };
       const loading = updateMessage(message('💬 メッセージとテンプレートを読み込み中だよ…'));
       return respondThenEdit(loading, ctx, env, interaction.token, () =>
@@ -200,25 +239,45 @@ async function handleComponent(interaction: any, env: Env, ctx: ExecutionContext
       return updateMessage(messageSelectMessage(next, sessionId));
     }
 
+    case 'issue_pick': {
+      if (session?.step !== 'issue_pick') return expired;
+      const number = Number(interaction.data.values[0]);
+      const loading = updateMessage(message('💬 issue とメッセージを読み込み中だよ…'));
+      return respondThenEdit(loading, ctx, env, interaction.token, () =>
+        withUserToken(env, userId, (token) =>
+          startCommentMessages(env, interaction, token, sessionId, session.repo, number, session.count),
+        ),
+      );
+    }
+
     case 'msg_select': {
-      if (session?.step !== 'messages') return expired;
+      if (session?.step !== 'messages' && session?.step !== 'comment_messages') return expired;
       const selectedIds = new Set<string>(interaction.data.values);
       const selected = session.messages
         .filter((m) => selectedIds.has(m.id))
         .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
       return respondThenEdit(updateMessage(message('🧠 要約中だよ…')), ctx, env, interaction.token, () =>
-        summarizeToPreview(env, sessionId, { ...session, messages: selected }),
+        session.step === 'messages'
+          ? summarizeToPreview(env, sessionId, { ...session, messages: selected })
+          : summarizeToCommentPreview(env, sessionId, { ...session, messages: selected }),
       );
     }
 
     case 'issue_regen': {
-      if (session?.step !== 'preview') return expired;
+      if (session?.step !== 'preview' && session?.step !== 'comment_preview') return expired;
       return respondThenEdit(updateMessage(message('🔄 要約し直してるよ…')), ctx, env, interaction.token, () =>
-        summarizeToPreview(env, sessionId, session),
+        session.step === 'preview'
+          ? summarizeToPreview(env, sessionId, session)
+          : summarizeToCommentPreview(env, sessionId, session),
       );
     }
 
     case 'issue_create': {
+      if (session?.step === 'comment_preview') {
+        return respondThenEdit(updateMessage(message('📝 コメントを投稿中だよ…')), ctx, env, interaction.token, () =>
+          withUserToken(env, userId, (token) => postCommentFromPreview(env, token, sessionId, session)),
+        );
+      }
       if (session?.step !== 'preview') return expired;
       return respondThenEdit(updateMessage(message('📝 issue を作成中だよ…')), ctx, env, interaction.token, () =>
         withUserToken(env, userId, (token) => createIssueFromPreview(env, token, sessionId, session)),
@@ -226,14 +285,15 @@ async function handleComponent(interaction: any, env: Env, ctx: ExecutionContext
     }
 
     case 'issue_edit': {
-      if (session?.step !== 'preview') return expired;
+      if (session?.step !== 'preview' && session?.step !== 'comment_preview') return expired;
       return jsonResponse({ type: InteractionResponseType.MODAL, data: editModal(session, sessionId) });
     }
 
     case 'issue_cancel': {
-      if (session?.step !== 'preview') return expired;
+      if (session?.step !== 'preview' && session?.step !== 'comment_preview') return expired;
       await deleteSession(env.KV, sessionId);
-      return updateMessage(message('issue の作成をキャンセルしたよ。'));
+      const what = session.step === 'preview' ? 'issue の作成' : 'コメントの投稿';
+      return updateMessage(message(`${what}をキャンセルしたよ。`));
     }
 
     default:
@@ -246,11 +306,15 @@ async function handleModalSubmit(interaction: any, env: Env): Promise<Response> 
   if (kind !== 'issue_edit_submit') return jsonResponse({ error: 'Not handled' }, 400);
 
   const session = await getSession(env.KV, sessionId);
-  if (session?.step !== 'preview') {
-    return updateMessage(message('セッションが期限切れだよ…もう一度 `/issue` してね。'));
-  }
-
   const values = modalValues(interaction.data.components);
+
+  if (session?.step === 'comment_preview') {
+    const next: SessionOf<'comment_preview'> = { ...session, body: values.get('body')?.trim() || session.body };
+    await setSession(env.KV, sessionId, next);
+    return updateMessage(commentPreviewMessage(next, sessionId));
+  }
+  if (session?.step !== 'preview') return updateMessage(message(EXPIRED_MESSAGE));
+
   const next: SessionOf<'preview'> = {
     ...session,
     title: values.get('title')?.trim() || session.title,
@@ -293,6 +357,16 @@ function respondThenEdit(
   return initial;
 }
 
+const EXPIRED_MESSAGE = 'セッションが期限切れだよ…もう一度コマンドを実行してね。';
+
+function commandOf(purpose: Purpose): string {
+  return purpose === 'issue' ? '/issue' : '/issue-comment';
+}
+
+function commandOption(interaction: any, name: string): unknown {
+  return interaction.data.options?.find((o: { name: string }) => o.name === name)?.value;
+}
+
 function discordUser(interaction: any): DiscordUser {
   // サーバー内では member.user、DM では user に入っている
   const user = interaction.member?.user ?? interaction.user;
@@ -305,16 +379,16 @@ async function withUserToken(
   fn: (token: string) => Promise<MessageBody>,
 ): Promise<MessageBody> {
   const token = await getUserToken(env, discordUserId);
-  if (!token) return message('GitHub との連携が切れたよ…もう一度 `/issue` からやり直してね。');
+  if (!token) return message('GitHub との連携が切れたよ…もう一度コマンドからやり直してね。');
   return fn(token);
 }
 
-async function linkPrompt(env: Env, origin: string, user: DiscordUser): Promise<MessageBody> {
+async function linkPrompt(env: Env, origin: string, user: DiscordUser, command: string): Promise<MessageBody> {
   const state = await createOAuthState(env.KV, user);
   return {
     content:
-      'issue を作るには、まず GitHub アカウントとの連携が必要だよ。\n' +
-      '下のボタンから GitHub で認可して、連携できたらもう一度 `/issue` を実行してね。（リンクは 10 分間有効だよ）',
+      'GitHub に投稿するには、まず GitHub アカウントとの連携が必要だよ。\n' +
+      `下のボタンから GitHub で認可して、連携できたらもう一度 \`${command}\` を実行してね。（リンクは 10 分間有効だよ）`,
     components: [
       {
         type: MessageComponentTypes.ACTION_ROW,
@@ -338,18 +412,86 @@ async function startRepoStep(
   sessionId: string,
   installationId: number,
   count: number,
+  purpose: Purpose,
 ): Promise<MessageBody> {
   const repos = await listUserRepositories(token, installationId);
   if (repos.length === 0) {
     return withInstallLink(
-      '⚠️ このインストール先には、あんたが issue を作れるリポジトリがないよ…\n' +
-        '使いたいリポジトリが App の対象に入っていないなら、下のボタンから追加して、もう一度 `/issue` を実行してね。',
+      '⚠️ このインストール先には、あんたが使えるリポジトリがないよ…\n' +
+        `使いたいリポジトリが App の対象に入っていないなら、下のボタンから追加して、もう一度 \`${commandOf(purpose)}\` を実行してね。`,
     );
   }
 
-  const session: SessionOf<'repo'> = { step: 'repo', installationId, repos, page: 0, count };
+  const session: SessionOf<'repo'> = { step: 'repo', installationId, repos, page: 0, count, purpose };
   await setSession(env.KV, sessionId, session);
   return repoMessage(session, sessionId);
+}
+
+const ISSUE_URL_PATTERN = /^(?:https?:\/\/)?(?:www\.)?github\.com\/([\w.-]+)\/([\w.-]+)\/(?:issues|pull)\/(\d+)(?:[/?#].*)?$/i;
+const ISSUE_SHORT_PATTERN = /^([\w.-]+)\/([\w.-]+)#(\d+)$/;
+
+async function startCommentFromRef(
+  env: Env,
+  interaction: any,
+  token: string,
+  sessionId: string,
+  text: string,
+  count: number,
+): Promise<MessageBody> {
+  const match = text.trim().match(ISSUE_URL_PATTERN) ?? text.trim().match(ISSUE_SHORT_PATTERN);
+  if (!match) {
+    return message(
+      'issue の指定が読めなかったよ…\n`https://github.com/owner/repo/issues/12` か `owner/repo#12` の形で書いてね。',
+    );
+  }
+  const [, owner, name, number] = match;
+
+  const repo = await findUsableRepo(token, owner, name);
+  if (!repo) {
+    return withInstallLink(
+      `⚠️ **${owner}/${name}** には、この GitHub App がインストールされていないか、あんたに権限がないよ。\n` +
+        'App が入っていないなら、リポジトリのオーナーに下のボタンからインストールしてもらってね。',
+    );
+  }
+  return startCommentMessages(env, interaction, token, sessionId, repo, Number(number), count);
+}
+
+// ユーザートークンでは、App が入っていない公開リポジトリの issue も読めてしまい、投稿の段階で初めて 403 になる。
+// 先に App の対象かどうかを確かめて、会話を選ばせてから失敗するのを避ける
+async function findUsableRepo(token: string, owner: string, name: string): Promise<RepoInfo | null> {
+  const installs = await listUserInstallations(token);
+  const install = installs.find((i) => i.account.toLowerCase() === owner.toLowerCase());
+  if (!install) return null;
+  const repos = await listUserRepositories(token, install.id);
+  const fullName = `${owner}/${name}`.toLowerCase();
+  return repos.find((r) => r.fullName.toLowerCase() === fullName) ?? null;
+}
+
+async function startCommentMessages(
+  env: Env,
+  interaction: any,
+  token: string,
+  sessionId: string,
+  repo: RepoInfo,
+  number: number,
+  count: number,
+): Promise<MessageBody> {
+  const [issue, messages] = await Promise.all([
+    getIssue(token, repo.owner, repo.name, number),
+    fetchRecentMessages(env, interaction.channel_id, interaction.guild_id, count),
+  ]);
+  if (!issue) return message(`**${repo.fullName}#${number}** が見つからなかったよ…`);
+  if (issue.isPullRequest) return message('プルリクエストにはコメントできないよ。issue を指定してね。');
+  if (messages.length === 0) return message('メッセージが見つからなかったよ…');
+
+  const target: IssueRef = { number: issue.number, title: issue.title, body: issue.body, url: issue.url };
+  const session: SessionOf<'comment_messages'> = { step: 'comment_messages', repo, issue: target, messages };
+  await setSession(env.KV, sessionId, session);
+  return messagePicker(
+    `**${issueLabel(repo, target)}** にコメントするよ！\n直近 **${messages.length}件** から要約したいメッセージを選んでね。`,
+    messages,
+    sessionId,
+  );
 }
 
 async function summarizeToPreview(
@@ -357,11 +499,7 @@ async function summarizeToPreview(
   sessionId: string,
   { repo, messages, templates, templateSource }: Omit<SessionOf<'messages'>, 'step'>,
 ): Promise<MessageBody> {
-  const transcript = messages
-    .map((m, i) => `[${i + 1}] ${m.author} (${m.createdAt})\n${m.content}\n🔗 ${m.url}`)
-    .join('\n\n');
-
-  const { title, body } = await summarize(env.AI, transcript, templates);
+  const { title, body } = await summarize(env.AI, transcriptOf(messages), templates);
   const session: SessionOf<'preview'> = { step: 'preview', repo, messages, title, body, templates, templateSource };
   await setSession(env.KV, sessionId, session);
   return previewMessage(session, sessionId);
@@ -378,6 +516,37 @@ async function createIssueFromPreview(
   const url = await createIssue(token, repo.owner, repo.name, session.title, issueBody);
   await deleteSession(env.KV, sessionId);
   return message(`🎉 **${repo.fullName}** に issue を作成したよ！\n${url}`);
+}
+
+async function summarizeToCommentPreview(
+  env: Env,
+  sessionId: string,
+  { repo, issue, messages }: Omit<SessionOf<'comment_messages'>, 'step'>,
+): Promise<MessageBody> {
+  const body = await summarizeForComment(env.AI, transcriptOf(messages), issue);
+  const session: SessionOf<'comment_preview'> = { step: 'comment_preview', repo, issue, messages, body };
+  await setSession(env.KV, sessionId, session);
+  return commentPreviewMessage(session, sessionId);
+}
+
+async function postCommentFromPreview(
+  env: Env,
+  token: string,
+  sessionId: string,
+  session: SessionOf<'comment_preview'>,
+): Promise<MessageBody> {
+  const { repo, issue } = session;
+  const url = await createComment(token, repo.owner, repo.name, issue.number, buildIssueBody(session.body, session.messages));
+  await deleteSession(env.KV, sessionId);
+  return message(`🎉 **${issueLabel(repo, issue)}** にコメントしたよ！\n${url}`);
+}
+
+function transcriptOf(messages: MessageEntry[]): string {
+  return messages.map((m, i) => `[${i + 1}] ${m.author} (${m.createdAt})\n${m.content}\n🔗 ${m.url}`).join('\n\n');
+}
+
+function issueLabel(repo: RepoInfo, issue: { number: number; title: string }): string {
+  return `${repo.fullName}#${issue.number}「${truncate(issue.title, 80)}」`;
 }
 
 // ---------- UI ビルダー ----------
@@ -443,7 +612,8 @@ function repoMessage(session: SessionOf<'repo'>, sessionId: string): MessageBody
   const components: object[] = [
     selectRow({
       custom_id: `repo_select:${sessionId}`,
-      placeholder: 'issue を立てるリポジトリを選んでね',
+      placeholder:
+        session.purpose === 'comment' ? 'コメントしたい issue があるリポジトリを選んでね' : 'issue を立てるリポジトリを選んでね',
       options: pageRepos.map((r) => ({ label: truncate(r.fullName, 100), value: `${r.owner}/${r.name}` })),
     }),
   ];
@@ -502,16 +672,41 @@ function templateNote(session: SessionOf<'preview'>): string {
     : `テンプレート ${templates.length} 件${where}から AI が選んだよ`;
 }
 
-function messageSelectMessage(session: SessionOf<'messages'>, sessionId: string): MessageBody {
+function issuePickMessage(session: SessionOf<'issue_pick'>, sessionId: string): MessageBody {
   return {
-    content: `**${session.repo.fullName}** に issue を立てるよ！\n直近 **${session.messages.length}件** から要約したいメッセージを選んでね。`,
+    content: `**${session.repo.fullName}** のどの issue にコメントする？（最近更新された、開いている issue を表示してるよ）`,
+    components: [
+      selectRow({
+        custom_id: `issue_pick:${sessionId}`,
+        placeholder: 'コメントする issue を選んでね',
+        options: session.issues.map((i) => ({
+          label: truncate(`#${i.number} ${i.title}`, 100),
+          value: String(i.number),
+          description: `更新: ${formatJst(i.updatedAt)}`,
+        })),
+      }),
+    ],
+  };
+}
+
+function messageSelectMessage(session: SessionOf<'messages'>, sessionId: string): MessageBody {
+  return messagePicker(
+    `**${session.repo.fullName}** に issue を立てるよ！\n直近 **${session.messages.length}件** から要約したいメッセージを選んでね。`,
+    session.messages,
+    sessionId,
+  );
+}
+
+function messagePicker(content: string, messages: MessageEntry[], sessionId: string): MessageBody {
+  return {
+    content,
     components: [
       selectRow({
         custom_id: `msg_select:${sessionId}`,
         placeholder: '要約したいメッセージを選んでね（複数選択可）',
         min_values: 1,
-        max_values: session.messages.length,
-        options: session.messages.map((m, i) => ({
+        max_values: messages.length,
+        options: messages.map((m, i) => ({
           label: truncate(`${i + 1}. ${m.author}: ${m.content.replace(/\n/g, ' ')}`, 100),
           value: m.id,
           description: truncate(m.createdAt, 100),
@@ -521,13 +716,49 @@ function messageSelectMessage(session: SessionOf<'messages'>, sessionId: string)
   };
 }
 
-function previewMessage(session: SessionOf<'preview'>, sessionId: string): MessageBody {
+// custom_id は issue とコメントで共通にして、押されたときにセッションの段階で振り分ける
+function previewButtons(sessionId: string, createLabel: string, editable: boolean) {
   const button = (action: 'create' | 'edit' | 'regen' | 'cancel', label: string, style: ButtonStyleTypes) => ({
     type: MessageComponentTypes.BUTTON,
     custom_id: `issue_${action}:${sessionId}`,
     label,
     style,
   });
+  return {
+    type: MessageComponentTypes.ACTION_ROW,
+    components: [
+      button('create', createLabel, ButtonStyleTypes.SUCCESS),
+      { ...button('edit', '✏️ 編集', ButtonStyleTypes.PRIMARY), disabled: !editable },
+      button('regen', '🔄 再生成', ButtonStyleTypes.SECONDARY),
+      button('cancel', 'キャンセル', ButtonStyleTypes.DANGER),
+    ],
+  };
+}
+
+function commentPreviewMessage(session: SessionOf<'comment_preview'>, sessionId: string): MessageBody {
+  return {
+    content: `**${issueLabel(session.repo, session.issue)}** にこの内容でコメントするよ。よければ「投稿する」を押してね！`,
+    embeds: [
+      {
+        title: truncate(`#${session.issue.number} ${session.issue.title}`, 256),
+        url: session.issue.url,
+        description: truncate(session.body, 4096),
+        footer: {
+          text: [
+            `元チャット ${session.messages.length} 件はコメントに折りたたんで添付するよ`,
+            session.body.length > TEXT_INPUT_MAX ? '本文が 4000 文字を超えているので編集はできないよ' : '',
+          ]
+            .filter(Boolean)
+            .join(' / '),
+        },
+      },
+    ],
+    // 編集モーダルは本文欄しかないので、本文を入れられないときは開けない
+    components: [previewButtons(sessionId, '✅ 投稿する', session.body.length <= TEXT_INPUT_MAX)],
+  };
+}
+
+function previewMessage(session: SessionOf<'preview'>, sessionId: string): MessageBody {
   return {
     content: `**${session.repo.fullName}** にこの内容で issue を立てるよ。よければ「作成する」を押してね！`,
     // Discord の Embed は title 256 文字、description 4096 文字まで
@@ -542,17 +773,7 @@ function previewMessage(session: SessionOf<'preview'>, sessionId: string): Messa
         },
       },
     ],
-    components: [
-      {
-        type: MessageComponentTypes.ACTION_ROW,
-        components: [
-          button('create', '✅ 作成する', ButtonStyleTypes.SUCCESS),
-          button('edit', '✏️ 編集', ButtonStyleTypes.PRIMARY),
-          button('regen', '🔄 再生成', ButtonStyleTypes.SECONDARY),
-          button('cancel', 'キャンセル', ButtonStyleTypes.DANGER),
-        ],
-      },
-    ],
+    components: [previewButtons(sessionId, '✅ 作成する', true)],
   };
 }
 
@@ -560,7 +781,7 @@ function previewMessage(session: SessionOf<'preview'>, sessionId: string): Messa
 const TEXT_INPUT_MAX = 4000;
 const GITHUB_TITLE_MAX = 256;
 
-function editModal(session: SessionOf<'preview'>, sessionId: string) {
+function editModal(session: SessionOf<'preview' | 'comment_preview'>, sessionId: string) {
   const input = (custom_id: string, label: string, style: TextStyleTypes, value: string, max_length: number) => ({
     type: MessageComponentTypes.ACTION_ROW,
     components: [
@@ -568,6 +789,14 @@ function editModal(session: SessionOf<'preview'>, sessionId: string) {
     ],
   });
   const bodyEditable = session.body.length <= TEXT_INPUT_MAX;
+
+  if (session.step === 'comment_preview') {
+    return {
+      custom_id: `issue_edit_submit:${sessionId}`,
+      title: 'コメントを編集',
+      components: [input('body', '本文（Markdown）', TextStyleTypes.PARAGRAPH, session.body, TEXT_INPUT_MAX)],
+    };
+  }
 
   return {
     custom_id: `issue_edit_submit:${sessionId}`,

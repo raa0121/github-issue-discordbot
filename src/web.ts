@@ -100,6 +100,7 @@ export function landingPage(env: Env): Response {
   <li>要約のプレビューを確認して「✅ 作成する」を押します。「✏️ 編集」で手直し、「🔄 再生成」で要約し直しもできます。</li>
 </ol>
 <p><code>/issue count:10</code> のように、表示するメッセージ数（最大 25 件）を指定できます。Bot の表示は、実行した本人にしか見えません。</p>
+<p>既存の issue に会話の要約を追記したいときは <code>/issue-comment</code> を使います。<code>issue:</code> に issue の URL か <code>owner/repo#12</code> を指定するか、省略してリポジトリと issue を一覧から選びます。</p>
 
 <h2>使えるリポジトリ</h2>
 <ul>

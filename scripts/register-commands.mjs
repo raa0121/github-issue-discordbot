@@ -22,6 +22,26 @@ const commands = [
     ],
   },
   {
+    name: 'issue-comment',
+    description: 'Discord の会話を要約して GitHub issue にコメントします',
+    type: 1,
+    contexts: [0],
+    options: [
+      {
+        type: 3,
+        name: 'issue',
+        description: 'issue の URL か owner/repo#番号（省略すると一覧から選ぶ）',
+      },
+      {
+        type: 4,
+        name: 'count',
+        description: '表示する直近メッセージ数（最大25件）',
+        min_value: 1,
+        max_value: 25,
+      },
+    ],
+  },
+  {
     name: 'issue-unlink',
     description: 'GitHub アカウントとの連携を解除します',
     type: 1,
